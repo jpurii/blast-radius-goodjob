@@ -236,7 +236,35 @@ class Selector:
     def select(self, patch_text) -> tuple[int, list[str]]:
         sel = 0
         notes = []
-        for old_path, new_path, hunks in parse_patch(patch_text):
+        # File changes git writes without ---/+++ hunks (renames, copies,
+        # binary files, empty new or deleted files) would otherwise be
+        # invisible: they can break any test, so they select everything.
+        # A mode-only change (the executable bit) cannot affect a test.
+        for block in re.split(r"(?m)^(?=diff --git )", patch_text):
+            if not block.startswith("diff --git "):
+                continue
+            has_hunks = re.search(r"(?m)^@@ ", block) is not None
+            if re.search(r"(?m)^(rename from|copy from|Binary files|GIT binary patch)", block):
+                return self.all, ["ALL(rename/copy/binary)"]
+            if not has_hunks and re.search(r"(?m)^(new file mode|deleted file mode)", block):
+                # An empty file added or deleted: same rules as any other
+                # added/deleted file (an unimported new module is harmless).
+                m = re.match(r"diff --git a/(\S+) b/(\S+)", block)
+                if not m:
+                    return self.all, ["ALL(empty file added/deleted)"]
+                added = re.search(r"(?m)^new file mode", block) is not None
+                path = m.group(2) if added else m.group(1)
+                old_p, new_p = ("/dev/null", path) if added else (path, "/dev/null")
+                b, note = self.select_file(old_p, new_p, path, [])
+                sel |= b
+                notes.append(f"{path.split('/')[-1]}:{note}(empty)")
+            if not has_hunks and not re.search(r"(?m)^(old mode|new mode|new file mode|deleted file mode)", block):
+                return self.all, ["ALL(unparsed file change)"]
+        parsed = parse_patch(patch_text)
+        if not parsed and patch_text.strip() and "diff --git " not in patch_text:
+            # Not a git-style diff we understand at all.
+            return self.all, ["ALL(unparsed patch)"]
+        for old_path, new_path, hunks in parsed:
             path = new_path if old_path == "/dev/null" else old_path
             bits, note = self.select_file(old_path, new_path, path, hunks)
             sel |= bits
