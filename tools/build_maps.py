@@ -4,7 +4,7 @@ Inputs (work/out): cov.sqlite (per-test line coverage), opens-*.json (files
 each test opened), classes-*.json (classes each test used, with their MROs).
 Sources: work/sqlglot at the pinned commit.
 
-Output (submission/maps):
+Output (blast-radius-goodjob/maps):
   tests.json        test ids in bit order (bit i of every bitset = tests[i])
   cov/<file>.json   {"spans": {line: [first, last, kind, scope, extra]},
                      "lines": {line: setIndex}, "sets": [hexbitset, ...]}
@@ -26,7 +26,7 @@ from pathlib import Path
 
 WORK = Path(__file__).parent
 SRC = WORK / "sqlglot"
-OUT = WORK.parent / "submission" / "maps"
+OUT = WORK.parent / "blast-radius-goodjob" / "maps"
 
 test_ids = [t["id"] for t in json.loads((WORK.parent / "kit/sample/tests.json").read_text())["tests"]]
 bit = {tid: i for i, tid in enumerate(test_ids)}
@@ -163,7 +163,7 @@ for path in py_files:
     data = {"spans": spans_for(path), "lines": lines, "sets": sets, "mls": multiline_strings(path)}
     out = OUT / "cov" / (path.replace("/", "__") + ".json")
     write_json(out, data)
-    total += out.stat().st_size
+    total += out.with_name(out.name + ".gz").stat().st_size
 print("cov maps", len(py_files), "files", total // 1024, "KB")
 
 # ------------------------------------------------------------------ opens
@@ -201,13 +201,123 @@ for path in py_files:
             name_sites[node.id].add((path, node.lineno))
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
             name_sites[node.attr].add((path, node.lineno))
-names = {}
+name_bits: dict[str, int] = {}
 for name, sites in name_sites.items():
-    s = set()
+    v = 0
     for path, ln in sites:
-        s |= cov.get(path, {}).get(ln, set())
-    if s:
-        names[name] = hexbits(s)
+        for b in cov.get(path, {}).get(ln, ()):
+            v |= 1 << b
+    name_bits[name] = v
+
+
+# Import-time consumers. Code outside any function runs at import, before
+# any test, so coverage credits it to no test. A name loaded there feeds what
+# that code builds: the names a module-level statement binds, or the class
+# whose body loads it. Propagate test sets along those edges to a fixpoint.
+def bound_by(stmt):
+    out = set()
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        out.add(stmt.name)
+    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        for a in stmt.names:
+            out.add((a.asname or a.name).split(".")[0])
+    else:
+        targets = []
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+            targets = [stmt.target]
+        for tg in targets:
+            for n in ast.walk(tg):
+                if isinstance(n, ast.Name):
+                    out.add(n.id)
+                elif isinstance(n, ast.Attribute):
+                    out.add(n.attr)
+    return out
+
+
+def import_time_loads(node):
+    """Names loaded by a statement outside nested function bodies."""
+    out = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # decorators, defaults and annotations run at import; the body not
+            stack.extend(n.decorator_list)
+            stack.extend(d for d in n.args.defaults + n.args.kw_defaults if d is not None)
+            continue
+        if isinstance(n, ast.Lambda):
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            out.add(n.id)
+        elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
+            out.add(n.attr)
+        if isinstance(n, ast.ClassDef) and n is not node:
+            continue  # nested class bodies get their own edges
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+edges = []  # (loaded name, ("name", target) | ("class", key))
+for path in py_files:
+    try:
+        tree = ast.parse((SRC / path).read_text("utf-8"))
+    except SyntaxError:
+        continue
+    module = path[:-3].replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[: -len(".__init__")]
+
+    def walk_module(stmts):
+        for st in stmts:
+            if isinstance(st, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    sub = getattr(st, field, None) or []
+                    walk_module([h for h in sub if isinstance(h, ast.stmt)] +
+                                [x for h in sub if isinstance(h, ast.ExceptHandler) for x in h.body])
+                for n in import_time_loads(getattr(st, "test", None) or getattr(st, "iter", None) or ast.Pass()):
+                    pass
+                continue
+            if isinstance(st, ast.ClassDef):
+                walk_class(st, st.name)
+            targets = bound_by(st)
+            loads = import_time_loads(st) if not isinstance(st, ast.ClassDef) else (
+                {x for b in st.bases + st.decorator_list + [k.value for k in st.keywords] for x in import_time_loads(b)})
+            for n in loads:
+                for tg in targets:
+                    if tg != n:
+                        edges.append((n, ("name", tg)))
+
+    def walk_class(cls, qual):
+        key = f"{module}.{qual}"
+        for st in cls.body:
+            if isinstance(st, ast.ClassDef):
+                walk_class(st, f"{qual}.{st.name}")
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                loads = import_time_loads(st)
+            else:
+                loads = import_time_loads(st)
+            for n in loads:
+                edges.append((n, ("class", key)))
+                edges.append((n, ("name", cls.name)))
+
+    walk_module(tree.body)
+
+class_bits = {k: int(h, 16) for k, h in ((k, hexbits(s)) for k, s in classes.items())}
+for it in range(30):
+    changed = 0
+    for n, (kind, tgt) in edges:
+        add = class_bits.get(tgt, 0) if kind == "class" else name_bits.get(tgt, 0)
+        cur = name_bits.get(n, 0)
+        if add & ~cur:
+            name_bits[n] = cur | add
+            changed += 1
+    if not changed:
+        break
+print("import-time edges", len(edges), "fixpoint rounds", it + 1)
+names = {n: format(v, "x") for n, v in name_bits.items() if v}
 write_json(OUT / "names.json", names)
 print("names", len(names))
 

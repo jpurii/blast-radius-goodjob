@@ -33,6 +33,7 @@ from pathlib import Path
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 APP = Path(__file__).resolve().parent
 MAPS = APP / "maps"
+SRC = Path(os.environ.get("BR_SRC", APP / "src"))  # sqlglot sources at the pinned commit
 
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 SETUP_NAMES = {"setUpClass", "tearDownClass", "setUpModule", "tearDownModule"}
@@ -125,6 +126,50 @@ def code_tokens(lines):
     return out
 
 
+def apply_hunks(old_lines, hunks):
+    """New file text from the pinned file's lines and the patch hunks, or
+    None if the hunks do not fit the file."""
+    out = []
+    pos = 0  # next old line index (0-based) not yet copied
+    for start, lines in hunks:
+        # "@@ -N,0" (no old lines) inserts after line N; otherwise N is the
+        # hunk's first old line.
+        has_old = any(tag != "+" for tag, _ in lines)
+        i = max(start - 1, 0) if has_old else start
+        if i < pos or i > len(old_lines):
+            return None
+        out.extend(old_lines[pos:i])
+        pos = i
+        for tag, text in lines:
+            if tag == " ":
+                if pos >= len(old_lines) or old_lines[pos] != text:
+                    return None
+                out.append(text)
+                pos += 1
+            elif tag == "-":
+                if pos >= len(old_lines) or old_lines[pos] != text:
+                    return None
+                pos += 1
+            else:
+                out.append(text)
+    out.extend(old_lines[pos:])
+    return "\n".join(out) + "\n"
+
+
+def file_tokens(text):
+    """Every code token of a file (comments and blank lines left out), or None
+    if it does not tokenize."""
+    out = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in (tokenize.COMMENT, tokenize.NL):
+                continue
+            out.append((tok.type, tok.string))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    return out
+
+
 def hunk_regions(hunk):
     """Old-side line numbers touched by the hunk: removed lines, plus the
     lines on both sides of every insertion point. Also returns the removed and
@@ -196,6 +241,9 @@ class Selector:
         if c is None:
             return self.all, "ALL(no map)"
         lines_cov, spans, mls = c
+        whole = self.whole_file(path, hunks)
+        if whole is not None:
+            return whole
         bits = 0
         notes = []
         for hunk in hunks:
@@ -237,6 +285,27 @@ class Selector:
                 notes.append(why)
         return bits, ",".join(sorted(set(notes))) or "code"
 
+    def whole_file(self, path, hunks):
+        """Checks on the patched file as a whole, when the pinned sources ship
+        with the image: a file that no longer compiles breaks every test that
+        imports it; a file whose code tokens are unchanged (comments and blank
+        lines only) changes no behavior. None means "decide hunk by hunk"."""
+        src = SRC / path
+        if not src.is_file():
+            return None
+        old_text = src.read_text("utf-8")
+        new_text = apply_hunks(old_text.split("\n")[:-1] if old_text.endswith("\n") else old_text.split("\n"), hunks)
+        if new_text is None:
+            return None
+        try:
+            compile(new_text, path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return self.all, "ALL(no longer compiles)"
+        old_tok, new_tok = file_tokens(old_text), file_tokens(new_text)
+        if old_tok is not None and old_tok == new_tok:
+            return 0, "comment(file)"
+        return None
+
     def scope_tests(self, path, kind, scope, extra, first, last, hunk):
         is_test_file = path.startswith("tests/")
         if kind == "f":
@@ -255,6 +324,10 @@ class Selector:
                 b = self.m.bits("classtests.json", f"{path}::{cls}") or self.m.bits("files.json", path)
                 return b, "test-class-body"
             b = self.m.bits("classes.json", scope)
+            if not b:
+                # No test ran a method on this class (enums, plain constant
+                # holders): its attributes are read in ways we did not trace.
+                return self.all, f"ALL(class {scope.rsplit('.', 1)[-1]} unused)"
             return b, f"class({scope.rsplit('.', 1)[-1]})"
         # module level
         if is_test_file and path.split("/")[-1].startswith("test_"):
@@ -271,6 +344,10 @@ class Selector:
             return b, "def-header"
         if not bound:
             return self.all, "ALL(module stmt)"
+        if not b:
+            # Nothing a test ran loads these names: they are only used at
+            # import time (or by name strings), which we cannot place.
+            return self.all, f"ALL(module {','.join(sorted(bound))[:30]} unplaced)"
         return b, f"module({','.join(sorted(bound))[:40]})"
 
     @staticmethod
