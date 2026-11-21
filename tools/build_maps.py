@@ -186,16 +186,18 @@ print("cov maps", len(py_files), "files", total // 1024, "KB")
 
 # ------------------------------------------------------------------ opens
 opens = collections.defaultdict(set)
+setup_opens = []  # (fixture path, nodeid whose setup phase opened it)
 for p in (WORK / "out").glob("opens-*.json"):
     for key, paths in json.loads(p.read_text()).items():
         nodeid, setup = (key[: -len("|setup")], True) if key.endswith("|setup") else (key, False)
         b = bit.get(nodeid)
-        bs = ({b} | class_mates(nodeid)) if (b is not None and setup) else {b if b is not None else -1}
         for path in paths:
-            opens[path].update(bs)
+            opens[path].add(b if b is not None else -1)
+            if setup and b is not None:
+                setup_opens.append((path, nodeid))
 collect_opened = sorted(p for p, s in opens.items() if -1 in s)
 print("fixtures opened outside a test:", collect_opened[:10])
-write_json(OUT / "opens.json", {p: hexbits(s - {-1}) for p, s in opens.items()})
+# opens.json is written after the name map (setup opens are refined with it)
 
 # ---------------------------------------------------------------- classes
 classes = collections.defaultdict(set)
@@ -340,6 +342,48 @@ print("import-time edges", len(edges), "fixpoint rounds", it + 1)
 names = {n: format(v, "x") for n, v in name_bits.items() if v}
 write_json(OUT / "names.json", names)
 print("names", len(names))
+
+
+# A fixture a class's setup opened reaches the class's tests that read what
+# setup stored it in: `cls.X = ...("<path suffix>")` -> tests loading X.
+# Unresolved (no literal path in setUpClass, as for f-string paths): every
+# test of the class.
+def setup_attrs(test_file, cls_name, fixture):
+    try:
+        tree = ast.parse((SRC / test_file).read_text("utf-8"))
+    except (OSError, SyntaxError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == cls_name:
+            for fn in node.body:
+                if not isinstance(fn, ast.FunctionDef) or fn.name not in ("setUpClass", "setUpModule"):
+                    continue
+                for st in ast.walk(fn):
+                    if not isinstance(st, ast.Assign):
+                        continue
+                    lits = [c.value for c in ast.walk(st.value)
+                            if isinstance(c, ast.Constant) and isinstance(c.value, str) and len(c.value) > 4]
+                    if any(fixture.endswith(s) for s in lits):
+                        return {t.attr for t in st.targets if isinstance(t, ast.Attribute)} or None
+    return None
+
+
+refined = 0
+for path, nodeid in setup_opens:
+    mates = class_mates(nodeid)
+    f, rest = nodeid.split("::", 1)
+    attrs = setup_attrs(f, rest.split("::")[0], path) if "::" in rest else None
+    use = 0
+    for a in attrs or ():
+        use |= name_bits.get(a, 0)
+    chosen = {b for b in mates if use >> b & 1} if use else set()
+    if chosen:
+        refined += 1
+        opens[path].update(chosen)
+    else:
+        opens[path].update(mates)
+print("setup opens", len(setup_opens), "refined by stored attribute", refined)
+write_json(OUT / "opens.json", {p: hexbits(s - {-1}) for p, s in opens.items()})
 
 # ------------------------------------------------------- tests per file/class
 by_file = collections.defaultdict(set)
