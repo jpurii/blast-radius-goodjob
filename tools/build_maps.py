@@ -50,12 +50,24 @@ def numbits_to_lines(blob):
 # ---------------------------------------------------------------- coverage
 db = sqlite3.connect(WORK / "out/cov.sqlite")
 files = {fid: p.replace("/src/sqlglot/", "") for fid, p in db.execute("select id, path from file")}
-ctx_bit = {}
+def class_mates(nodeid):
+    """Every test sharing the test's class (or file, outside a class): what a
+    test's setup phase does (setUpClass, class/module fixtures) runs once, in
+    whichever of them comes first, and every one of them depends on it."""
+    f, rest = nodeid.split("::", 1)
+    key = f + "::" + rest.split("::")[0] + "::" if "::" in rest else f + "::"
+    return {b for t, b in bit.items() if t.startswith(key)}
+
+
+ctx_bits = {}
 for cid, c in db.execute("select id, context from context"):
     if c:
-        b = bit.get(c.rsplit("|", 1)[0])
+        nodeid, _, phase = c.rpartition("|")
+        if not nodeid:
+            nodeid, phase = c, ""
+        b = bit.get(nodeid)
         if b is not None:
-            ctx_bit[cid] = b
+            ctx_bits[cid] = class_mates(nodeid) | {b} if phase == "setup" else {b}
 empty_ctx = {cid for cid, c in db.execute("select id, context from context") if not c}
 cov = collections.defaultdict(lambda: collections.defaultdict(set))
 imp = collections.defaultdict(set)  # lines run outside any test (import, collection)
@@ -63,11 +75,11 @@ for fid, cid, blob in db.execute("select file_id, context_id, numbits from line_
     if cid in empty_ctx:
         imp[files[fid]].update(numbits_to_lines(blob))
         continue
-    b = ctx_bit.get(cid)
-    if b is None:
+    bs = ctx_bits.get(cid)
+    if bs is None:
         continue
     for ln in numbits_to_lines(blob):
-        cov[files[fid]][ln].add(b)
+        cov[files[fid]][ln].update(bs)
 
 # --------------------------------------------------------------- AST spans
 
@@ -175,10 +187,12 @@ print("cov maps", len(py_files), "files", total // 1024, "KB")
 # ------------------------------------------------------------------ opens
 opens = collections.defaultdict(set)
 for p in (WORK / "out").glob("opens-*.json"):
-    for nodeid, paths in json.loads(p.read_text()).items():
+    for key, paths in json.loads(p.read_text()).items():
+        nodeid, setup = (key[: -len("|setup")], True) if key.endswith("|setup") else (key, False)
         b = bit.get(nodeid)
+        bs = ({b} | class_mates(nodeid)) if (b is not None and setup) else {b if b is not None else -1}
         for path in paths:
-            opens[path].add(b if b is not None else -1)
+            opens[path].update(bs)
 collect_opened = sorted(p for p, s in opens.items() if -1 in s)
 print("fixtures opened outside a test:", collect_opened[:10])
 write_json(OUT / "opens.json", {p: hexbits(s - {-1}) for p, s in opens.items()})

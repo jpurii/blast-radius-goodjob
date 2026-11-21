@@ -89,6 +89,16 @@ def pytest_runtest_protocol(item, nextitem):
     _current[0] = "<between>"
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    # Setup runs class- and module-level fixtures (setUpClass) inside the
+    # first test of the class: tag what it opens so the maps can credit the
+    # whole class, not just that first test.
+    _current[0] = item.nodeid + "|setup"
+    yield
+    _current[0] = item.nodeid
+
+
 def pytest_sessionfinish(session, exitstatus):
     worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
     with open(f"/out/opens-{worker}.json", "w") as f:
