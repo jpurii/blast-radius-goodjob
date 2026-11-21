@@ -258,6 +258,11 @@ class Selector:
         whole = self.whole_file(path, hunks)
         if whole is not None:
             return whole
+        if not lines_cov and not imp and spans:
+            # No line of this file ran during the whole test session, not even
+            # at import or collection (a script like tests/gen_fixtures.py):
+            # no test can see the change.
+            return 0, "never loaded"
         bits = 0
         notes = []
         for hunk in hunks:
@@ -308,6 +313,11 @@ class Selector:
                     bits |= lines_cov.get(x, 0)
                 if extra is not None:
                     bits |= lines_cov.get(extra, 0)
+                if kind in ("c", "m") and self.inside_lambda_body(path, hunk):
+                    # Only the lambda's body changed; it runs when called, so
+                    # the line's coverage is exactly the tests that call it.
+                    notes.append("lambda-body")
+                    continue
                 b, why = self.scope_tests(path, kind, scope, extra, first, last, hunk)
                 bits |= b
                 notes.append(why)
@@ -368,6 +378,10 @@ class Selector:
             if tag in "+-":
                 names.update(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", text.split("#", 1)[0]))
         bound = self.bound_names(hunk)
+        if not bound:
+            # The edit is inside a multi-line statement (a dict or list
+            # entry): the names it binds are on the statement's first line.
+            bound = self.statement_binds(path, first, last)
         b = 0
         for n in bound:
             b |= self.m.bits("names.json", n)
@@ -380,6 +394,75 @@ class Selector:
             # import time (or by name strings), which we cannot place.
             return self.all, f"ALL(module {','.join(sorted(bound))[:30]} unplaced)"
         return b, f"module({','.join(sorted(bound))[:40]})"
+
+    _lambdas = {}
+
+    def inside_lambda_body(self, path, hunk):
+        """True when the hunk replaces exactly one line, and the old and new
+        text differ only inside the body of a lambda that sits on that line
+        (not its parameters, whose defaults run at definition)."""
+        import ast
+
+        changed, around, removed, added = hunk_regions(hunk)
+        if len(changed) != 1 or len(removed) != 1 or len(added) != 1:
+            return False
+        ln = next(iter(changed))
+        old, new = removed[0], added[0]
+        # The differing column range in the old line.
+        i = 0
+        while i < min(len(old), len(new)) and old[i] == new[i]:
+            i += 1
+        j = 0
+        while j < min(len(old), len(new)) - i and old[len(old) - 1 - j] == new[len(new) - 1 - j]:
+            j += 1
+        lo, hi = i, len(old) - j  # old[lo:hi] was replaced
+        if path not in self._lambdas:
+            src = SRC / path
+            spans = []
+            if src.is_file():
+                try:
+                    tree = ast.parse(src.read_text("utf-8"))
+                    for n in ast.walk(tree):
+                        if isinstance(n, ast.Lambda) and n.body.lineno == n.body.end_lineno:
+                            spans.append((n.body.lineno, n.body.col_offset, n.body.end_col_offset))
+                except SyntaxError:
+                    pass
+            self._lambdas[path] = spans
+        # col offsets are UTF-8 byte offsets; only trust ASCII lines
+        if not old.isascii():
+            return False
+        return any(line == ln and c0 <= lo and hi <= c1 for line, c0, c1 in self._lambdas[path])
+
+    @staticmethod
+    def statement_binds(path, first, last):
+        """Names bound by the module-level statement on lines first..last of
+        the pinned source (empty if it cannot be parsed)."""
+        import ast
+        import textwrap
+
+        src = SRC / path
+        if not src.is_file():
+            return set()
+        lines = src.read_text("utf-8").split("\n")
+        # A span's `last` is its header end for compound statements; for a
+        # simple statement it is the whole statement.
+        text = textwrap.dedent("\n".join(lines[first - 1:last]))
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return set()
+        out = set()
+        for st in tree.body:
+            targets = []
+            if isinstance(st, ast.Assign):
+                targets = st.targets
+            elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+                targets = [st.target]
+            for tg in targets:
+                for n in ast.walk(tg):
+                    if isinstance(n, ast.Name):
+                        out.add(n.id)
+        return out
 
     ASSIGN = re.compile(r"\s*([A-Z_][A-Z0-9_]*)\s*(?::[^=]*)?=(?!=)")
 
