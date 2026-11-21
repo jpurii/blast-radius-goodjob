@@ -337,4 +337,33 @@ for tid, b in bit.items():
         by_class[f + "::" + rest.split("::")[0]].add(b)
 write_json(OUT / "files.json", {k: hexbits(v) for k, v in by_file.items()})
 write_json(OUT / "classtests.json", {k: hexbits(v) for k, v in by_class.items()})
+# ------------------------------------------- attributes read in hidden ways
+# Names a class constant can be read through without a test running a line
+# that loads it: loads inside function bodies that run at import (the
+# metaclasses copy and derive class constants there), and identifier-like
+# string constants (getattr/__dict__.get by name). The selector does not
+# narrow class-constant edits for these names.
+dyn = set()
+for path in py_files:
+    if not path.startswith("sqlglot/"):
+        continue
+    try:
+        tree = ast.parse((SRC / path).read_text("utf-8"))
+    except SyntaxError:
+        continue
+    imp_lines = imp.get(path, set())
+    fn_lines = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            body = node.body if isinstance(node.body, list) else [node.body]
+            for st in body:
+                fn_lines.update(range(st.lineno, (st.end_lineno or st.lineno) + 1))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+            dyn.add(node.value)
+        elif isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+            if node.lineno in imp_lines and node.lineno in fn_lines:
+                dyn.add(node.id if isinstance(node, ast.Name) else node.attr)
+write_json(OUT / "dynattrs.json", sorted(dyn))
+print("dynamic attribute names", len(dyn))
 print("done ->", OUT)

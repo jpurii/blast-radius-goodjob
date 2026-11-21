@@ -50,6 +50,11 @@ def read_map(path: Path):
     return json.loads(gzip.decompress(path.with_name(path.name + ".gz").read_bytes()))
 
 
+class _Everything:
+    def __contains__(self, item):
+        return True
+
+
 class Maps:
     def __init__(self):
         self.ids = read_map(MAPS / "tests.json")
@@ -76,6 +81,14 @@ class Maps:
             else:
                 self._cov[path] = None
         return self._cov[path]
+
+    @property
+    def dyn(self):
+        if "_dyn" not in self.__dict__:
+            p = MAPS / "dynattrs.json"
+            self._dyn = set(read_map(p)) if p.with_name(p.name + ".gz").exists() else None
+        # Without the list, treat every name as dynamic (no narrowing).
+        return self._dyn if self._dyn is not None else _Everything()
 
     def bits(self, name, key):
         h = self.get(name).get(key)
@@ -343,6 +356,9 @@ class Selector:
                 # No test ran a method on this class (enums, plain constant
                 # holders): its attributes are read in ways we did not trace.
                 return self.all, f"ALL(class {scope.rsplit('.', 1)[-1]} unused)"
+            narrow = self.narrow_constant(path, first, last, hunk, b)
+            if narrow is not None:
+                return narrow, f"const({scope.rsplit('.', 1)[-1]})"
             return b, f"class({scope.rsplit('.', 1)[-1]})"
         # module level
         if is_test_file and path.split("/")[-1].startswith("test_"):
@@ -364,6 +380,33 @@ class Selector:
             # import time (or by name strings), which we cannot place.
             return self.all, f"ALL(module {','.join(sorted(bound))[:30]} unplaced)"
         return b, f"module({','.join(sorted(bound))[:40]})"
+
+    ASSIGN = re.compile(r"\s*([A-Z_][A-Z0-9_]*)\s*(?::[^=]*)?=(?!=)")
+
+    def narrow_constant(self, path, first, last, hunk, class_bits):
+        """An edit to an UPPER_CASE class constant `NAME = ...` reaches only
+        tests that use the class AND run a line reading NAME, unless NAME is
+        also read in ways no test line shows (import-time code, getattr by
+        string). None means "no narrowing"."""
+        src = SRC / path
+        if not src.is_file():
+            return None
+        lines = src.read_text("utf-8").split("\n")
+        if first < 1 or first > len(lines):
+            return None
+        m = self.ASSIGN.match(lines[first - 1])
+        if not m:
+            return None
+        # Every changed line must belong to this one statement.
+        changed, around, _, added = hunk_regions(hunk)
+        if not changed or any(ln < first or ln > last for ln in changed):
+            return None
+        name = m.group(1)
+        if name in self.m.dyn:
+            return None
+        users = self.m.bits("names.json", name)
+        narrowed = class_bits & users
+        return narrowed or None
 
     @staticmethod
     def bound_names(hunk):
