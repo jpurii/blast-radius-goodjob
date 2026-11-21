@@ -184,6 +184,30 @@ def file_tokens(text):
     return out
 
 
+# Files whose classes compare in ways that break on None (env.py's reverse
+# sort key does `other.obj == self.obj`).
+NONE_EQ_UNSAFE = {"sqlglot/executor/env.py"}
+_IS_NOT_NONE = re.compile(r"\bis\s+not\s+None\b")
+_IS_NONE = re.compile(r"\bis\s+None\b")
+_NE_NONE = re.compile(r"!=\s*None\b")
+_EQ_NONE = re.compile(r"(?<![=!<>])==\s*None\b")
+
+
+def none_compare_swap(removed, added):
+    """True when one line changed and the only difference is an identity vs
+    equality comparison with None (is None / == None, is not None / != None)."""
+    if len(removed) != 1 or len(added) != 1 or removed[0] == added[0]:
+        return False
+
+    def norm(s):
+        s = _IS_NOT_NONE.sub("!= None", s)
+        s = _IS_NONE.sub("== None", s)
+        s = _NE_NONE.sub("!= None", s)
+        return _EQ_NONE.sub("== None", s)
+
+    return norm(removed[0]) == norm(added[0])
+
+
 def hunk_regions(hunk):
     """Old-side line numbers touched by the hunk: removed lines, plus the
     lines on both sides of every insertion point. Also returns the removed and
@@ -271,6 +295,12 @@ class Selector:
             in_string = any(ln in mls for ln in touched)
             if not in_string and code_tokens(removed) == code_tokens(added):
                 notes.append("comment")
+                continue
+            if not in_string and path not in NONE_EQ_UNSAFE and none_compare_swap(removed, added):
+                # `x is None` <-> `x == None` (or the negations): every
+                # __eq__ in sqlglot returns False for None, so the result
+                # cannot change (an equivalent mutant).
+                notes.append("equivalent(None)")
                 continue
             # Statements the hunk touches. Removed lines name them directly;
             # an insertion point names the statements on either side.
