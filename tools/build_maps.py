@@ -383,6 +383,34 @@ for path, nodeid in setup_opens:
     else:
         opens[path].update(mates)
 print("setup opens", len(setup_opens), "refined by stored attribute", refined)
+
+# ------------------------------------------------- weak-mutation profile
+# out/wm-*.json (lab/brwm.py): per test, the condition sites where an
+# and<->or swap (2-operand condition) or a </<= or >/>= swap would infect
+# state. Map per file: {"line:col": hexbits of infected tests, or "*" when
+# the site also ran outside any test (import time: no pruning)}.
+wm_sites = set()
+for p in (WORK / "out").glob("wm-sites-*.json"):
+    wm_sites.update(json.loads(p.read_text()))
+wm_bits = collections.defaultdict(set)
+wm_star = set()
+for p in (WORK / "out").glob("wm-*.json"):
+    if p.name.startswith("wm-sites-"):
+        continue
+    for key, sites in json.loads(p.read_text()).items():
+        nodeid, setup = (key[: -len("|setup")], True) if key.endswith("|setup") else (key, False)
+        b = bit.get(nodeid)
+        for s in sites:
+            if b is None:
+                wm_star.add(s)  # outside a test (import, collection, between)
+            else:
+                wm_bits[s].update(class_mates(nodeid) | {b} if setup else {b})
+wm = collections.defaultdict(dict)
+for s in wm_sites:
+    path, line, col = s.rsplit(":", 2)
+    wm[path][f"{line}:{col}"] = "*" if s in wm_star else hexbits(wm_bits.get(s, ()))
+write_json(OUT / "wm.json", wm)
+print("weak-mutation sites", len(wm_sites), "files", len(wm), "import-time", len(wm_star))
 write_json(OUT / "opens.json", {p: hexbits(s - {-1}) for p, s in opens.items()})
 
 # ------------------------------------------------------- tests per file/class

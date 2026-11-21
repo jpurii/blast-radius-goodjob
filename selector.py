@@ -367,10 +367,21 @@ class Selector:
                         bits |= self.all
                         notes.append("ALL(runs at import)")
                         continue
+                sb = 0
                 for x in range(first, last + 1):
-                    bits |= lines_cov.get(x, 0)
+                    sb |= lines_cov.get(x, 0)
                 if extra is not None:
-                    bits |= lines_cov.get(extra, 0)
+                    sb |= lines_cov.get(extra, 0)
+                if kind == "f" and path.startswith("sqlglot/"):
+                    mask = self.weak_mask(path, hunk)
+                    if mask is not None:
+                        # Weak mutation: of the tests that ran the line, only
+                        # those where the swapped operator would have changed
+                        # the outcome at least once can be affected.
+                        bits |= sb & mask
+                        notes.append("weak-mutation")
+                        continue
+                bits |= sb
                 if kind in ("c", "m") and self.inside_lambda_body(path, hunk):
                     # Only the lambda's body changed; it runs when called, so
                     # the line's coverage is exactly the tests that call it.
@@ -452,6 +463,85 @@ class Selector:
             # import time (or by name strings), which we cannot place.
             return self.all, f"ALL(module {','.join(sorted(bound))[:30]} unplaced)"
         return b, f"module({','.join(sorted(bound))[:40]})"
+
+    _trees = {}
+    SWAPS = {("and", "or"), ("or", "and"), ("<", "<="), ("<=", "<"), (">", ">="), (">=", ">")}
+    PURE_CALLS = {"isinstance", "issubclass", "len", "type", "callable", "hasattr"}
+    PURE_METHODS = {"get"}
+
+    def weak_mask(self, path, hunk):
+        """For a one-line swap of `and`/`or` in a two-operand condition, or of
+        `<`/`<=` or `>`/`>=` in a single comparison, the tests in which that
+        swap would have changed the outcome at least once (from the lab's
+        weak-mutation profile, maps/wm.json). None: no such knowledge."""
+        import ast
+
+        changed, around, removed, added = hunk_regions(hunk)
+        if len(changed) != 1 or len(removed) != 1 or len(added) != 1:
+            return None
+        old, new = removed[0], added[0]
+        if not old.isascii() or not new.isascii():
+            return None
+        tok = re.compile(r"\w+|==|!=|<=|>=|->|\*\*|//|<<|>>|\S")
+        ot = [(m.group(), m.start()) for m in tok.finditer(old)]
+        nt = [m.group() for m in tok.finditer(new)]
+        if len(ot) != len(nt):
+            return None
+        diffs = [i for i in range(len(ot)) if ot[i][0] != nt[i]]
+        if len(diffs) != 1 or (ot[diffs[0]][0], nt[diffs[0]]) not in self.SWAPS:
+            return None
+        col = ot[diffs[0]][1]
+        ln = next(iter(changed))
+        sites = self.m.get("wm.json").get(path) if (MAPS / "wm.json.gz").exists() else None
+        if not sites:
+            return None
+        if path not in self._trees:
+            try:
+                self._trees[path] = ast.parse((SRC / path).read_text("utf-8"))
+            except (OSError, SyntaxError):
+                self._trees[path] = None
+        tree = self._trees[path]
+        if tree is None:
+            return None
+        pos = (ln, col)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.BoolOp) and len(n.values) == 2:
+                a, b = n.values
+                if not ((a.end_lineno, a.end_col_offset) <= pos < (b.lineno, b.col_offset)):
+                    continue
+                if ot[diffs[0]][0] not in ("and", "or") or not self.pure(b):
+                    return None
+            elif isinstance(n, ast.Compare) and len(n.ops) == 1:
+                a, b = n.left, n.comparators[0]
+                if not ((a.end_lineno, a.end_col_offset) <= pos < (b.lineno, b.col_offset)):
+                    continue
+                if ot[diffs[0]][0] not in ("<", "<=", ">", ">="):
+                    return None
+            else:
+                continue
+            v = sites.get(f"{n.lineno}:{n.col_offset}")
+            if v is None or v == "*":
+                return None
+            return int(v, 16)
+        return None
+
+    def pure(self, node):
+        """No side effects when evaluated (names, attributes, constants,
+        comparisons, and a few known-pure calls)."""
+        import ast
+
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name) and f.id in self.PURE_CALLS:
+                    continue
+                if isinstance(f, ast.Attribute) and f.attr in self.PURE_METHODS:
+                    continue
+                return False
+            if isinstance(n, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await, ast.Lambda,
+                              ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                return False
+        return True
 
     _lambdas = {}
 
