@@ -56,8 +56,13 @@ for cid, c in db.execute("select id, context from context"):
         b = bit.get(c.rsplit("|", 1)[0])
         if b is not None:
             ctx_bit[cid] = b
+empty_ctx = {cid for cid, c in db.execute("select id, context from context") if not c}
 cov = collections.defaultdict(lambda: collections.defaultdict(set))
+imp = collections.defaultdict(set)  # lines run outside any test (import, collection)
 for fid, cid, blob in db.execute("select file_id, context_id, numbits from line_bits"):
+    if cid in empty_ctx:
+        imp[files[fid]].update(numbits_to_lines(blob))
+        continue
     b = ctx_bit.get(cid)
     if b is None:
         continue
@@ -160,7 +165,8 @@ for path in py_files:
             set_idx[key] = len(sets)
             sets.append(hexbits(tests))
         lines[ln] = set_idx[key]
-    data = {"spans": spans_for(path), "lines": lines, "sets": sets, "mls": multiline_strings(path)}
+    data = {"spans": spans_for(path), "lines": lines, "sets": sets, "mls": multiline_strings(path),
+            "imp": sorted(imp.get(path, ()))}
     out = OUT / "cov" / (path.replace("/", "__") + ".json")
     write_json(out, data)
     total += out.with_name(out.name + ".gz").stat().st_size

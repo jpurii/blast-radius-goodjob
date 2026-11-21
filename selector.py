@@ -35,6 +35,7 @@ APP = Path(__file__).resolve().parent
 MAPS = APP / "maps"
 SRC = Path(os.environ.get("BR_SRC", APP / "src"))  # sqlglot sources at the pinned commit
 
+IMPORT_WIDE = 50  # import-time code run by at least this many tests is trusted to coverage
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 SETUP_NAMES = {"setUpClass", "tearDownClass", "setUpModule", "tearDownModule"}
 HARMLESS_SUFFIXES = (".md", ".rst", ".txt", ".png", ".svg", ".html", ".css")
@@ -71,7 +72,7 @@ class Maps:
                 mls = set()
                 for a, b in d.get("mls", []):
                     mls.update(range(a, b + 1))
-                self._cov[path] = (lines, spans, mls)
+                self._cov[path] = (lines, spans, mls, set(d.get("imp", ())))
             else:
                 self._cov[path] = None
         return self._cov[path]
@@ -240,7 +241,7 @@ class Selector:
         c = self.m.cov(path)
         if c is None:
             return self.all, "ALL(no map)"
-        lines_cov, spans, mls = c
+        lines_cov, spans, mls, imp = c
         whole = self.whole_file(path, hunks)
         if whole is not None:
             return whole
@@ -276,6 +277,20 @@ class Selector:
                     bits |= b
                     continue
                 first, last, kind, scope, extra = span
+                if kind == "f" and path.startswith("sqlglot/") and any(
+                        x in imp for x in range(first, last + 1)):
+                    # This function body runs while sqlglot is imported
+                    # (metaclasses, table builders): what it builds is used by
+                    # tests that never run the line themselves. Lines that
+                    # many tests also run (the parser) are reached through
+                    # coverage; narrowly covered ones are not.
+                    span_bits = 0
+                    for x in range(first, last + 1):
+                        span_bits |= lines_cov.get(x, 0)
+                    if bin(span_bits).count("1") < IMPORT_WIDE:
+                        bits |= self.all
+                        notes.append("ALL(runs at import)")
+                        continue
                 for x in range(first, last + 1):
                     bits |= lines_cov.get(x, 0)
                 if extra is not None:
