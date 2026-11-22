@@ -505,11 +505,27 @@ class Selector:
             return None
         pos = (ln, col)
         for n in ast.walk(tree):
+            if isinstance(n, ast.BoolOp) and 3 <= len(n.values) <= 6:
+                # a chain: find which gap holds the swapped operator
+                vals = n.values
+                gap = next((p for p in range(len(vals) - 1)
+                            if (vals[p].end_lineno, vals[p].end_col_offset) <= pos
+                            < (vals[p + 1].lineno, vals[p + 1].col_offset)), None)
+                if gap is None:
+                    continue
+                op = "and" if isinstance(n.op, ast.And) else "or"
+                if ot[diffs[0]][0] != op or not all(self.pure(v) for v in vals[1:]):
+                    return None
+                v = sites.get(f"{n.lineno}:{n.col_offset}#{gap}")
+                if v is None or v == "*":
+                    return None
+                return int(v, 16)
             if isinstance(n, ast.BoolOp) and len(n.values) == 2:
                 a, b = n.values
                 if not ((a.end_lineno, a.end_col_offset) <= pos < (b.lineno, b.col_offset)):
                     continue
-                if ot[diffs[0]][0] not in ("and", "or") or not self.pure(b):
+                op = "and" if isinstance(n.op, ast.And) else "or"
+                if ot[diffs[0]][0] != op or not self.pure(b):
                     return None
             elif isinstance(n, ast.Compare) and len(n.ops) == 1:
                 a, b = n.left, n.comparators[0]

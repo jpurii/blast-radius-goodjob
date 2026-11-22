@@ -64,6 +64,65 @@ def _br_or(key, a, thunk):
     return b
 
 
+def _and_range(truths, idx):
+    """Short-circuit `and` over operand indexes with known truths (None:
+    an operand the original never evaluated)."""
+    for i in idx:
+        t = truths[i] if i < len(truths) else None
+        if t is None:
+            return None
+        if not t:
+            return False
+    return True
+
+
+def _mut_truth(is_and, truths, k, p):
+    """Truth of the chain with the operator after operand p swapped, from the
+    original evaluation's truths; None if that needs an unevaluated operand."""
+    if is_and:
+        # x0 and .. and xp  or  x(p+1) and .. and x(k-1)
+        left = _and_range(truths, range(0, p + 1))
+        if left is None or left:
+            return left
+        return _and_range(truths, range(p + 1, k))
+    # x0 or .. or x(p-1) or (xp and x(p+1)) or x(p+2) or ..
+    groups = [range(i, i + 1) for i in range(0, p)] + [range(p, p + 2)] + [range(i, i + 1) for i in range(p + 2, k)]
+    for g in groups:
+        v = _and_range(truths, g)
+        if v is None:
+            return None
+        if v:
+            return True
+    return False
+
+
+def _br_bool(key, is_and, first, *thunks):
+    """A chain of 3+ operands joined by one operator, evaluated exactly as
+    Python does; flags "key#p" when swapping the operator after operand p
+    would change the truth of the result."""
+    t = bool(first)
+    truths = [t]
+    res = first
+    i = 0
+    stop = (not t) if is_and else t
+    while not stop and i < len(thunks):
+        v = thunks[i]()
+        t = bool(v)
+        truths.append(t)
+        res = v
+        i += 1
+        stop = (not t) if is_and else t
+    orig = truths[-1]
+    k = len(thunks) + 1
+    for p in range(k - 1):
+        m = _mut_truth(is_and, truths, k, p)
+        if m is None or m != orig:
+            _flag(f"{key}#{p}")
+    return res
+
+
+builtins._br_bool = _br_bool
+
 _PLAIN = (int, float, str, bytes)
 
 
@@ -155,7 +214,19 @@ class Rewriter(ast.NodeTransformer):
     def visit_BoolOp(self, node):
         in_ctx = id(node) in self.bool_ctx
         self.generic_visit(node)
-        if not (self.fn_depth and in_ctx and len(node.values) == 2 and lambda_safe(node.values[1])):
+        k = len(node.values)
+        if self.fn_depth and in_ctx and 3 <= k <= 6 and all(lambda_safe(v) for v in node.values[1:]):
+            key = self.key(node)
+            for p in range(k - 1):
+                _sites.add(f"{key}#{p}")
+            empty = ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[])
+            call = ast.Call(
+                func=ast.Name("_br_bool", ast.Load()),
+                args=[ast.Constant(key), ast.Constant(isinstance(node.op, ast.And)), node.values[0]]
+                + [ast.Lambda(empty, v) for v in node.values[1:]],
+                keywords=[])
+            return ast.copy_location(call, node)
+        if not (self.fn_depth and in_ctx and k == 2 and lambda_safe(node.values[1])):
             return node
         key = self.key(node)
         _sites.add(key)
