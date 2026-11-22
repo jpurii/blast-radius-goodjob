@@ -289,6 +289,33 @@ class Selector:
             return self.fixture(path, hunks)
         return self.all, "ALL(unknown file)"
 
+    _subproc = None
+
+    def subproc_bits(self, path, stmt_lines, spans, touched):
+        """Tests that run Python in a subprocess (test_lazy_load imports
+        sqlglot in a fresh interpreter): line coverage never sees what that
+        subprocess runs, so maps/subproc.json lists its lines. A test is
+        added when the hunk touches a statement whose lines it ran."""
+        if self._subproc is None:
+            self._subproc = {}
+            if (MAPS / "subproc.json.gz").exists():
+                for b, per_file in self.m.get("subproc.json").items():
+                    for p, runs in per_file.items():
+                        self._subproc.setdefault(p, []).append((int(b), runs))
+        entries = self._subproc.get(path)
+        if not entries:
+            return 0
+        lines = set(touched)
+        for ln in stmt_lines:
+            span = spans.get(ln)
+            if span is not None:
+                lines.update(range(span[0], span[1] + 1))
+        out = 0
+        for b, runs in entries:
+            if any(a <= x <= z for a, z in runs for x in lines):
+                out |= 1 << b
+        return out
+
     _helper_mods = {}
 
     def run_loader(self, loader, path, text):
@@ -412,6 +439,7 @@ class Selector:
                     while down < ln + 200 and down not in spans:
                         down += 1
                     stmt_lines.update(x for x in (up, down) if x in spans)
+            bits |= self.subproc_bits(path, stmt_lines, spans, touched)
             for ln in stmt_lines:
                 span = spans.get(ln)
                 if span is None:
@@ -479,6 +507,36 @@ class Selector:
             return 0, "comment(file)"
         return None
 
+    _IMPORT_LINE = re.compile(r"^\s*(import\s|from\s+\S+\s+import\b)")
+    _import_spans = {}
+
+    def import_stmt(self, path, first, hunk):
+        """True when the hunk adds or removes an import line, or the touched
+        statement (starting at `first`) is an import outside any function."""
+        import ast
+
+        if any(tag in "+-" and self._IMPORT_LINE.match(text) for tag, text in hunk[1]):
+            return True
+        if path not in self._import_spans:
+            spans = []
+            try:
+                tree = ast.parse((SRC / path).read_text("utf-8"))
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                tree = None
+
+            def walk(node):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        continue
+                    if isinstance(child, (ast.Import, ast.ImportFrom)):
+                        spans.append((child.lineno, child.end_lineno))
+                    walk(child)
+
+            if tree is not None:
+                walk(tree)
+            self._import_spans[path] = spans
+        return any(a <= first <= b for a, b in self._import_spans[path])
+
     def scope_tests(self, path, kind, scope, extra, first, last, hunk):
         is_test_file = path.startswith("tests/")
         if kind == "f":
@@ -496,6 +554,8 @@ class Selector:
                 cls = scope.rsplit(".", 1)[-1]
                 b = self.m.bits("classtests.json", f"{path}::{cls}") or self.m.bits("files.json", path)
                 return b, "test-class-body"
+            if self.import_stmt(path, first, hunk):
+                return self.all, "ALL(class-body import)"
             b = self.m.bits("classes.json", scope)
             if not b:
                 # No test ran a method on this class (enums, plain constant
@@ -508,6 +568,11 @@ class Selector:
         # module level
         if is_test_file and path.split("/")[-1].startswith("test_"):
             return self.m.bits("files.json", path), "test-module"
+        if self.import_stmt(path, first, hunk):
+            # An import that runs while the module loads: a new, removed or
+            # changed one can fail every importer (circular imports) or load
+            # modules early (test_lazy_load), far beyond the names it binds.
+            return self.all, "ALL(module import)"
         names = set()
         for tag, text in hunk[1]:
             if tag in "+-":

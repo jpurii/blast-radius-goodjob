@@ -22,6 +22,7 @@ import ast
 import collections
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 WORK = Path(__file__).parent
@@ -541,3 +542,34 @@ for path in py_files:
 write_json(OUT / "dynattrs.json", sorted(dyn))
 print("dynamic attribute names", len(dyn))
 print("done ->", OUT)
+
+# ------------------------------------------------- subprocess coverage
+# Tests that run `python -c ...` in a subprocess (lab/subproc_cov.py): the
+# lines that subprocess executes, as ranges per file. Unresolved subprocess
+# tests would make the selector unsafe, so they stop the build.
+sp_path = WORK / "out" / "subproc.json"
+if sp_path.exists():
+    sp = json.loads(sp_path.read_text())
+    if sp.get("unresolved"):
+        sys.exit(f"unresolved subprocess tests: {sp['unresolved']}")
+    out_sp = {}
+    for nodeid, per_file in sp.items():
+        if nodeid == "unresolved" or nodeid not in bit:
+            continue
+        rng = {}
+        for path, lines in per_file.items():
+            runs, start, prev = [], None, None
+            for ln in sorted(lines):
+                if start is None:
+                    start = prev = ln
+                elif ln == prev + 1:
+                    prev = ln
+                else:
+                    runs.append([start, prev])
+                    start = prev = ln
+            if start is not None:
+                runs.append([start, prev])
+            rng[path] = runs
+        out_sp[str(bit[nodeid])] = rng
+    write_json(OUT / "subproc.json", out_sp)
+    print("subprocess tests", len(out_sp))
