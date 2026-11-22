@@ -35,7 +35,6 @@ APP = Path(__file__).resolve().parent
 MAPS = APP / "maps"
 SRC = Path(os.environ.get("BR_SRC", APP / "src"))  # sqlglot sources at the pinned commit
 
-IMPORT_WIDE = 50  # import-time code run by at least this many tests is trusted to coverage
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 SETUP_NAMES = {"setUpClass", "tearDownClass", "setUpModule", "tearDownModule"}
 HARMLESS_SUFFIXES = (".md", ".rst", ".txt", ".png", ".svg", ".html", ".css")
@@ -449,15 +448,15 @@ class Selector:
                 first, last, kind, scope, extra = span
                 if kind == "f" and path.startswith("sqlglot/") and any(
                         x in imp for x in range(first, last + 1)):
-                    # This function body runs while sqlglot is imported
-                    # (metaclasses, table builders): what it builds is used by
-                    # tests that never run the line themselves. Lines that
-                    # many tests also run (the parser) are reached through
-                    # coverage; narrowly covered ones are not.
-                    span_bits = 0
-                    for x in range(first, last + 1):
-                        span_bits |= lines_cov.get(x, 0)
-                    if bin(span_bits).count("1") < IMPORT_WIDE:
+                    # This function body runs outside any test: while sqlglot
+                    # is imported (metaclasses, table builders) or while pytest
+                    # imports test files (module-level parsing). What it builds
+                    # is used by tests that never run the line themselves, and
+                    # if it now raises, whole test files fail to import (lab:
+                    # deleting a line in errors.highlight_sql broke 34 test
+                    # files while coverage picked 150 tests). Coverage cannot
+                    # place either, however many tests also run the line.
+                    if True:
                         bits |= self.all
                         notes.append("ALL(runs at import)")
                         continue
