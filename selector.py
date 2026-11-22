@@ -278,7 +278,7 @@ class Selector:
             return 0, "harmless"
         if old_path == "/dev/null" or new_path == "/dev/null":
             if new_path == "/dev/null" and path.startswith("tests/fixtures/"):
-                return self.fixture(path)
+                return self.fixture(path, None)
             if old_path == "/dev/null" and path.startswith(("sqlglot/", "tests/")) and path.endswith(".py") \
                     and not path.endswith("__init__.py") and not path.split("/")[-1].startswith(("test_", "conftest")):
                 return 0, "new-module"
@@ -286,10 +286,76 @@ class Selector:
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
             return self.python(path, hunks)
         if path.startswith("tests/fixtures/"):
-            return self.fixture(path)
+            return self.fixture(path, hunks)
         return self.all, "ALL(unknown file)"
 
-    def fixture(self, path):
+    _helper_mods = {}
+
+    def run_loader(self, loader, path, text):
+        """Evaluate a setUpClass loader expression (from maps/setup.json)
+        with the pinned helper functions, reading `text` for the fixture."""
+        import builtins
+        import io
+
+        env = {}
+        for name, mod in loader["mods"].items():
+            g = self._helper_mods.get(mod)
+            if g is None:
+                f = SRC / mod
+                g = {"__name__": "br_" + mod.replace("/", "_")[:-3], "__file__": str(f)}
+                exec(compile(f.read_text("utf-8"), str(f), "exec"), g)
+                self._helper_mods[mod] = g
+
+            def fake_open(file, *a, _p=path, _t=text, **k):
+                if str(file).replace("\\", "/").endswith(_p):
+                    return io.StringIO(_t)
+                return builtins.open(file, *a, **k)
+
+            g["open"] = fake_open
+            env[name] = g[name]
+        return eval(loader["expr"], {"__builtins__": builtins}, env)
+
+    def setup_fixture(self, path, hunks):
+        """A fixture that a test class's setUpClass loads into an attribute
+        (maps/setup.json). If the patched file makes the loader raise, the
+        class setup fails and every test of the class errors; if the loaded
+        value is unchanged, no test that reads the attribute can see the
+        edit; otherwise the attribute's readers. Plus tests that open the
+        file themselves. None: not such a fixture."""
+        if not (MAPS / "setup.json.gz").exists():
+            return None
+        e = self.m.get("setup.json").get(path)
+        if not e:
+            return None
+        cls, readers, direct = (int(e[k], 16) for k in ("cls", "readers", "direct"))
+        if hunks is None:
+            return cls | direct, "fixture-setup(deleted)"
+        try:
+            old_text = (SRC / path).read_text("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return cls | direct, "fixture-setup(no source)"
+        lines = old_text.split("\n")[:-1] if old_text.endswith("\n") else old_text.split("\n")
+        new_text = apply_hunks(lines, hunks)
+        if new_text is None:
+            return cls | direct, "fixture-setup(hunks do not fit)"
+        changed = False
+        for loader in e["loaders"]:
+            try:
+                before = self.run_loader(loader, path, old_text)
+            except Exception:  # noqa: BLE001
+                return cls | direct, "fixture-setup(loader fails on pinned file)"
+            try:
+                after = self.run_loader(loader, path, new_text)
+            except Exception:  # noqa: BLE001
+                return cls | direct, "fixture-setup(class setup fails)"
+            if before != after:
+                changed = True
+        return direct | (readers if changed else 0), "fixture-setup" + ("" if changed else "(same data)")
+
+    def fixture(self, path, hunks):
+        s = self.setup_fixture(path, hunks)
+        if s is not None:
+            return s
         h = self.m.get("opens.json").get(path)
         if h:
             return int(h, 16), "fixture"

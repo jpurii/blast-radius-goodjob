@@ -2,7 +2,7 @@
 
 The selector applies each patch to these sources to check that the changed
 files still compile and to compare their code tokens exactly. Only *.py files
-under sqlglot/ and tests/ are kept. Usage: python fetch_src.py DEST_DIR
+under sqlglot/ and tests/, and the SQL fixtures, are kept. Usage: python fetch_src.py DEST_DIR
 """
 
 import io
@@ -27,7 +27,10 @@ def main():
             if len(parts) != 2:
                 continue
             rel = parts[1]
-            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")):
+            keep = rel.endswith(".py") and rel.startswith(("sqlglot/", "tests/"))
+            # SQL fixtures: the selector re-runs class-setup loaders on them
+            keep = keep or (rel.startswith("tests/fixtures/") and rel.endswith(".sql"))
+            if not keep:
                 continue
             out = dest / rel
             out.parent.mkdir(parents=True, exist_ok=True)

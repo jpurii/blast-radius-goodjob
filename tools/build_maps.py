@@ -368,6 +368,63 @@ def setup_attrs(test_file, cls_name, fixture):
     return None
 
 
+def setup_loader(test_file, cls_name, fixture):
+    """The setUpClass statement `cls.X = <expr>` whose expr names the
+    fixture, when expr only calls builtins and functions imported from a
+    module under tests/: {"expr": src, "mods": {name: "tests/x.py"}}."""
+    try:
+        src = (SRC / test_file).read_text("utf-8")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return None
+    imported = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("tests.") and not node.level:
+            for a in node.names:
+                imported[a.asname or a.name] = node.module.replace(".", "/") + ".py"
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == cls_name:
+            for fn in node.body:
+                if not isinstance(fn, ast.FunctionDef) or fn.name != "setUpClass":
+                    continue
+                for st in ast.walk(fn):
+                    lits = [c.value for c in ast.walk(st) if isinstance(c, ast.Constant)
+                            and isinstance(c.value, str) and len(c.value) > 4 and fixture.endswith(c.value)]
+                    if lits and isinstance(st, (ast.stmt,)):
+                        hits.append(st)
+    # innermost statements only (no other hit inside them)
+    hits = [h for h in hits if not any(h is not o and any(x is o for x in ast.walk(h)) for o in hits)]
+    if len(hits) != 1 or not isinstance(hits[0], ast.Assign):
+        return None
+    st = hits[0]
+    if not all(isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "cls"
+               for t in st.targets):
+        return None
+    mods = {}
+    for n in ast.walk(st.value):
+        if isinstance(n, ast.Name):
+            if n.id in imported:
+                mods[n.id] = imported[n.id]
+            elif n.id not in ("list", "tuple", "dict", "set", "sorted", "str"):
+                return None
+        elif isinstance(n, (ast.Attribute, ast.Lambda, ast.NamedExpr)):
+            return None
+    return {"expr": ast.get_source_segment(src, st.value), "mods": mods}
+
+
+# Actual reads of setUpClass attributes (lab/brattr.py), finer than the
+# line-level name map: {class "file::Class": {attr: {test bits}}}.
+attr_reads = collections.defaultdict(lambda: collections.defaultdict(set))
+for p in (WORK / "out").glob("attr-*.json"):
+    for nodeid, names_read in json.loads(p.read_text()).items():
+        b = bit.get(nodeid)
+        if b is None or nodeid.count("::") < 2:
+            continue
+        for a in names_read:
+            attr_reads[nodeid.rsplit("::", 1)[0]][a].add(b)
+
+setup_map = {}
 refined = 0
 for path, nodeid in setup_opens:
     mates = class_mates(nodeid)
@@ -382,7 +439,38 @@ for path, nodeid in setup_opens:
         opens[path].update(chosen)
     else:
         opens[path].update(mates)
+    loader = setup_loader(f, rest.split("::")[0], path) if chosen and "::" in rest else None
+    if loader:
+        e = setup_map.setdefault(path, {"cls": set(), "readers": set(), "loaders": []})
+        e["cls"] |= mates
+        traced = attr_reads.get(f + "::" + rest.split("::")[0])
+        if traced:
+            exact = set().union(*(traced.get(a, set()) for a in attrs)) & mates
+            e["readers"] |= exact
+            e["traced"] = True
+        else:
+            e["readers"] |= chosen
+        if loader not in e["loaders"]:
+            e["loaders"].append(loader)
 print("setup opens", len(setup_opens), "refined by stored attribute", refined)
+# Tests that open each setup-loaded fixture themselves (outside any setup).
+direct = collections.defaultdict(set)
+for p in (WORK / "out").glob("opens-*.json"):
+    for key, paths in json.loads(p.read_text()).items():
+        if key.endswith("|setup"):
+            continue
+        b = bit.get(key)
+        for path in paths:
+            if path in setup_map:
+                direct[path].add(b if b is not None else -1)
+setup_json = {}
+for path, e in setup_map.items():
+    if -1 in direct[path]:
+        continue  # also read outside any test: keep the plain opens rule
+    setup_json[path] = {"cls": hexbits(e["cls"]), "readers": hexbits(e["readers"]),
+                        "direct": hexbits(direct[path]), "loaders": e["loaders"]}
+write_json(OUT / "setup.json", setup_json)
+print("setup-loaded fixtures", {k: v["loaders"] for k, v in setup_json.items()})
 
 # ------------------------------------------------- weak-mutation profile
 # out/wm-*.json (lab/brwm.py): per test, the condition sites where an
