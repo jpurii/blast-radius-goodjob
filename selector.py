@@ -870,6 +870,12 @@ def main():
                     nums.add(n)
             bits >>= 1
             i += 1
+        # PROBE (practice-board diagnostic only, never a final entry): drop
+        # the two slowest tests to measure how much of the practice cost
+        # they make and on how many commits they really fail.
+        nums -= {number_by_id.get(x) for x in (
+            "tests/test_parser.py::TestParser::test_max_nodes",
+            "tests/test_executor.py::TestExecutor::test_execute_tpcds")}
         workers = pack(nums, ms)
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
         log(patch.stem, len(nums), " ".join(notes))
