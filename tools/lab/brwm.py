@@ -146,6 +146,40 @@ def _br_cmp(key, op, a, b):
     return a >= b
 
 
+import enum as _enum
+
+# __eq__ implementations with no side effects (sqlglot Expression.__eq__
+# hashes and caches on the nodes, dialect metaclass __eq__ does lookups, and
+# tuples recurse into their items: all of those count as infected).
+_PURE_EQ = {object.__eq__, int.__eq__, float.__eq__, str.__eq__, bytes.__eq__, type.__eq__,
+            getattr(_enum.Enum, "__eq__", object.__eq__)}
+
+
+def _br_eqid(key, op, a, b):
+    """op 0 `is`, 1 `is not`, 2 `==`, 3 `!=`. Flags the site when swapping
+    is <-> == (is not <-> !=) could give a different value here."""
+    if op == 0 or op == 2:
+        ident = a is b
+    else:
+        ident = a is not b
+    if type(a).__eq__ not in _PURE_EQ or type(b).__eq__ not in _PURE_EQ:
+        _flag(key)
+        if op < 2:
+            return ident
+        return a == b if op == 2 else a != b
+    try:
+        eq = (a == b) if op in (0, 2) else (a != b)
+    except Exception:  # noqa: BLE001
+        _flag(key)
+        if op < 2:
+            return ident
+        raise
+    if type(eq) is not bool or eq != ident:
+        _flag(key)
+    return ident if op < 2 else eq
+
+
+builtins._br_eqid = _br_eqid
 builtins._br_and = _br_and
 builtins._br_or = _br_or
 builtins._br_cmp = _br_cmp
@@ -241,6 +275,18 @@ class Rewriter(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
+        eqops = {ast.Is: 0, ast.IsNot: 1, ast.Eq: 2, ast.NotEq: 3}
+        if self.fn_depth and len(node.ops) == 1 and type(node.ops[0]) in eqops:
+            sides = (node.left, node.comparators[0])
+            if any(isinstance(x, ast.Constant) and x.value is None for x in sides):
+                return node  # None comparisons: the selector's static rule
+            key = self.key(node)
+            _sites.add(key)
+            call = ast.Call(func=ast.Name("_br_eqid", ast.Load()),
+                            args=[ast.Constant(key), ast.Constant(eqops[type(node.ops[0])]), node.left,
+                                  node.comparators[0]],
+                            keywords=[])
+            return ast.copy_location(call, node)
         ops = {ast.Lt: 0, ast.LtE: 1, ast.Gt: 2, ast.GtE: 3}
         if not (self.fn_depth and len(node.ops) == 1 and type(node.ops[0]) in ops):
             return node

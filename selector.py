@@ -465,13 +465,15 @@ class Selector:
         return b, f"module({','.join(sorted(bound))[:40]})"
 
     _trees = {}
-    SWAPS = {("and", "or"), ("or", "and"), ("<", "<="), ("<=", "<"), (">", ">="), (">=", ">")}
+    SWAPS = {("and", "or"), ("or", "and"), ("<", "<="), ("<=", "<"), (">", ">="), (">=", ">"),
+             ("is", "=="), ("==", "is"), ("is not", "!="), ("!=", "is not")}
+    EQ_OPS = {"is": "Is", "is not": "IsNot", "==": "Eq", "!=": "NotEq"}
     PURE_CALLS = {"isinstance", "issubclass", "len", "type", "callable", "hasattr"}
     PURE_METHODS = {"get"}
 
     def weak_mask(self, path, hunk):
         """For a one-line swap of `and`/`or` in a two-operand condition, or of
-        `<`/`<=` or `>`/`>=` in a single comparison, the tests in which that
+        `<`/`<=`, `>`/`>=`, `is`/`==` or `is not`/`!=` in a single comparison, the tests in which that
         swap would have changed the outcome at least once (from the lab's
         weak-mutation profile, maps/wm.json). None: no such knowledge."""
         import ast
@@ -482,9 +484,9 @@ class Selector:
         old, new = removed[0], added[0]
         if not old.isascii() or not new.isascii():
             return None
-        tok = re.compile(r"\w+|==|!=|<=|>=|->|\*\*|//|<<|>>|\S")
-        ot = [(m.group(), m.start()) for m in tok.finditer(old)]
-        nt = [m.group() for m in tok.finditer(new)]
+        tok = re.compile(r"\bis\s+not\b|\w+|==|!=|<=|>=|->|\*\*|//|<<|>>|\S")
+        ot = [(re.sub(r"\s+", " ", m.group()), m.start()) for m in tok.finditer(old)]
+        nt = [re.sub(r"\s+", " ", m.group()) for m in tok.finditer(new)]
         if len(ot) != len(nt):
             return None
         diffs = [i for i in range(len(ot)) if ot[i][0] != nt[i]]
@@ -531,7 +533,12 @@ class Selector:
                 a, b = n.left, n.comparators[0]
                 if not ((a.end_lineno, a.end_col_offset) <= pos < (b.lineno, b.col_offset)):
                     continue
-                if ot[diffs[0]][0] not in ("<", "<=", ">", ">="):
+                o = ot[diffs[0]][0]
+                if o in self.EQ_OPS:
+                    # is <-> ==, is not <-> != : the node's operator must be the one replaced
+                    if type(n.ops[0]).__name__ != self.EQ_OPS[o]:
+                        return None
+                elif o not in ("<", "<=", ">", ">="):
                     return None
             else:
                 continue
