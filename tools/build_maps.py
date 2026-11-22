@@ -573,3 +573,53 @@ if sp_path.exists():
         out_sp[str(bit[nodeid])] = rng
     write_json(OUT / "subproc.json", out_sp)
     print("subprocess tests", len(out_sp))
+
+# ------------------------------------------- dict-constant key reads
+# out/dict-*.json (lab/brdict.py): per context, "path:line|<key repr>" for a
+# key read, "path:line|*" plus "path:line|*<op>" for a whole-dict read. Map
+# per file: {"<line>": "*" (no pruning) | {"all": hex, "keys": {repr: hex | "*"}}}.
+# A dict is unprunable when it was read whole outside a test, or copied
+# (iterated, items(), copy, merged, repr...) inside one (a lazily built copy
+# can serve later tests); only truth/len tests count as whole reads of that
+# test alone. A key read outside a test makes that key unprunable.
+NON_COPY = {"*__bool__", "*__len__"}
+d_star, d_all, d_keys, d_keystar = set(), collections.defaultdict(set), collections.defaultdict(
+    lambda: collections.defaultdict(set)), collections.defaultdict(set)
+d_sites = set()
+for p in (WORK / "out").glob("dict-sites-*.json"):
+    d_sites.update(json.loads(p.read_text()))
+for p in (WORK / "out").glob("dict-*.json"):
+    if p.name.startswith("dict-sites-"):
+        continue
+    for key, reads in json.loads(p.read_text()).items():
+        nodeid, setup = (key[: -len("|setup")], True) if key.endswith("|setup") else (key, False)
+        b = bit.get(nodeid)
+        tb = (class_mates(nodeid) | {b} if setup else {b}) if b is not None else None
+        for r in reads:
+            site, _, k = r.partition("|")
+            if k.startswith("*") and k != "*":
+                if tb is None or k not in NON_COPY:
+                    d_star.add(site)
+                continue
+            if k == "*":
+                if tb is None:
+                    d_star.add(site)
+                else:
+                    d_all[site].update(tb)
+                continue
+            if tb is None:
+                d_keystar[site].add(k)
+            else:
+                d_keys[site][k].update(tb)
+dmap = collections.defaultdict(dict)
+for s in d_sites:
+    path, line = s.rsplit(":", 1)
+    if s in d_star:
+        dmap[path][line] = "*"
+        continue
+    keys = {k: hexbits(v) for k, v in d_keys[s].items()}
+    for k in d_keystar[s]:
+        keys[k] = "*"
+    dmap[path][line] = {"all": hexbits(d_all[s]), "keys": keys}
+write_json(OUT / "dicts.json", dmap)
+print("dict sites", len(d_sites), "unprunable", len(d_star))

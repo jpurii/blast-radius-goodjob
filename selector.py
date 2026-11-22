@@ -537,8 +537,98 @@ class Selector:
             self._import_spans[path] = spans
         return any(a <= first <= b for a, b in self._import_spans[path])
 
+    _dict_trees = {}
+
+    def dict_key_mask(self, path, hunk):
+        """A hunk that only changes the value of one existing constant key in
+        a module- or class-level `NAME = {...}` dict display: the tests that
+        read that key, or read the dict whole (maps/dicts.json, from the
+        lab's key-read trace). None when that does not apply."""
+        import ast
+
+        if not (MAPS / "dicts.json.gz").exists():
+            return None
+        sites = self.m.get("dicts.json").get(path)
+        if not sites:
+            return None
+        try:
+            old_text = (SRC / path).read_text("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        lines = old_text.split("\n")[:-1] if old_text.endswith("\n") else old_text.split("\n")
+        new_text = apply_hunks(lines, [hunk])
+        if new_text is None:
+            return None
+        try:
+            old_tree = self._dict_trees.get(path) or ast.parse(old_text)
+            self._dict_trees[path] = old_tree
+            new_tree = ast.parse(new_text)
+        except SyntaxError:
+            return None
+
+        def displays(tree):
+            out = []
+
+            def walk(node):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        continue
+                    if isinstance(child, (ast.Assign, ast.AnnAssign)) and isinstance(child.value, ast.Dict):
+                        out.append(child)
+                    walk(child)
+
+            walk(tree)
+            return out
+
+        old_d, new_d = displays(old_tree), displays(new_tree)
+        if len(old_d) != len(new_d):
+            return None
+        changed = [(a, b) for a, b in zip(old_d, new_d) if ast.dump(a) != ast.dump(b)]
+        if len(changed) != 1:
+            return None
+        a, b = changed[0]
+        if ast.dump(a.targets[0] if isinstance(a, ast.Assign) else a.target) != ast.dump(
+                b.targets[0] if isinstance(b, ast.Assign) else b.target):
+            return None
+        if isinstance(a, ast.Assign) and len(a.targets) != 1:
+            return None
+        da, db = a.value, b.value
+        if a.value.lineno != b.value.lineno or len(da.keys) != len(db.keys):
+            return None
+        diff = []
+        for ka, va, kb, vb in zip(da.keys, da.values, db.keys, db.values):
+            if ka is None or kb is None or ast.dump(ka) != ast.dump(kb):
+                if ka is None and kb is None and ast.dump(va) == ast.dump(vb):
+                    continue
+                return None  # a key itself (or a ** unpacking) changed
+            if ast.dump(va) != ast.dump(vb):
+                diff.append(ka)
+        if len(diff) != 1 or not isinstance(diff[0], ast.Constant):
+            return None
+        # One line changed, inside that entry: nothing else in the module.
+        changed_l, _around, removed, added = hunk_regions(hunk)
+        if len(removed) != 1 or len(added) != 1 or len(changed_l) != 1:
+            return None
+        i = next(j for j, kk in enumerate(da.keys) if kk is diff[0])
+        ln = next(iter(changed_l))
+        if not (diff[0].lineno <= ln <= da.values[i].end_lineno):
+            return None
+        entry = sites.get(str(da.lineno))
+        if entry is None or entry == "*":
+            return None
+        k = entry["keys"].get(repr(diff[0].value))
+        if k == "*":
+            return None
+        bits = int(entry["all"] or "0", 16) | int(k or "0", 16)
+        return bits, f"dict-key({repr(diff[0].value)[:20]})"
+
     def scope_tests(self, path, kind, scope, extra, first, last, hunk):
         is_test_file = path.startswith("tests/")
+        if kind != "f":
+            if not (is_test_file and path.split("/")[-1].startswith("test_")):
+                dk = self.dict_key_mask(path, hunk)
+                if dk is not None:
+                    return dk
         if kind == "f":
             fn = scope.rsplit("|", 1)[-1]
             if is_test_file and fn in SETUP_NAMES:
