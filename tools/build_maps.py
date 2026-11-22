@@ -110,7 +110,12 @@ def spans_for(path: str):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # A header change (signature, defaults, decorators) reaches the
                 # function's callers, who run its first body statement.
-                extra = body[0].lineno
+                # A docstring never runs: take the first statement after it.
+                stmts = body
+                if (len(stmts) > 1 and isinstance(stmts[0], ast.Expr) and isinstance(stmts[0].value, ast.Constant)
+                        and isinstance(stmts[0].value.value, str)):
+                    stmts = stmts[1:]
+                extra = stmts[0].lineno
             entry = [first, last, kind, scope, extra]
             for ln in range(first, last + 1):
                 prev = spans.get(ln)
